@@ -1,0 +1,105 @@
+# Notifleet configuration reference.
+#
+# Everything active below is enough to run: one API key, one Discord
+# destination, one route. Copy this file to config.toml, fill in the
+# Discord webhook URL and generate an API key (see README), and it works.
+#
+# Every other option Notifleet supports is included further down, commented
+# out, with its meaning and valid range. Uncomment and edit what you need;
+# leave the rest commented out. Secrets always use env:VARIABLE references,
+# resolved from the environment after this file is parsed — never put a
+# literal token/webhook value here.
+
+# --- Active minimal configuration -------------------------------------------
+
+# Docker default; for native use "127.0.0.1:8080" instead.
+listen = "0.0.0.0:8080"
+# Docker default; for native use "./data" instead.
+data_dir = "/data"
+
+api_keys = ["env:NOTIFLEET_API_KEY"]
+
+[destinations.discord]
+provider = "discord"
+webhook_url = "env:DISCORD_WEBHOOK_URL"
+
+[routes]
+default = ["discord"]
+
+# --- Optional server settings -----------------------------------------------
+# All have defaults; uncomment only to change one.
+
+# Maximum stored jobs (pending + not-yet-pruned terminal) before new
+# notifications are rejected with 503. Range 1-100000.
+# max_jobs = 10000
+
+# Maximum delivery attempts per destination before a target is marked
+# failed. Range 1-10.
+# max_attempts = 5
+
+# How long a fully-delivered/failed job's record is kept on disk before
+# being pruned. Pending jobs are never pruned regardless of age.
+# Range 1-720 (hours).
+# retention_hours = 24
+
+# Shared token-bucket rate limit across all API keys combined, applied to
+# every endpoint except /healthz. Range 1-60000.
+# requests_per_minute = 120
+
+# --- Optional destinations --------------------------------------------------
+# Add only the ones you use; each must be listed in a route below to
+# receive anything. Names must be 1-64 letters/digits/underscores/hyphens.
+
+# [destinations.slack]
+# provider = "slack"
+# webhook_url = "env:SLACK_WEBHOOK_URL"
+
+# [destinations.phone]
+# provider = "pushover"
+# token = "env:PUSHOVER_APP_TOKEN"
+# user = "env:PUSHOVER_USER_KEY"
+
+# [destinations.telegram]
+# provider = "telegram"
+# token = "env:TELEGRAM_BOT_TOKEN"
+# chat_id = "REPLACE_WITH_CHAT_ID"
+
+# [destinations.ntfy]
+# provider = "ntfy"
+# server_url = "https://ntfy.sh"
+# # Public topics are not access-controlled merely because the name is
+# # random. Use a protected topic or self-hosted server for sensitive data.
+# topic = "REPLACE_WITH_A_RANDOM_TOPIC"
+# # token = "env:NTFY_TOKEN"
+# # Only for a trusted, self-hosted HTTPS ntfy server on your own LAN:
+# # allow_private_network = true
+
+# --- Optional additional routes ---------------------------------------------
+# A route fans out to every destination listed, not round-robin. Add
+# entries to the active [routes] table above rather than duplicating it;
+# these are shown as reference only.
+
+# [routes]
+# default = ["discord", "slack"]
+# urgent = ["discord", "phone", "telegram"]
+# personal = ["ntfy"]
+
+# --- Optional feeds ----------------------------------------------------------
+# A feed polls an HTTPS RSS 2.0 or Atom URL on its own interval and pushes
+# one notification per new entry to the named fleet (an existing target in
+# [routes] above — "fleet" is just what a route is called from a feed's
+# perspective). The first poll after a feed's dedup state is created only
+# records current entries; it does not notify a backfill of everything
+# already in the feed. At most 32 feeds. Names use the same 1-64
+# letters/digits/underscores/hyphens rule as destinations.
+
+# [feeds.blog]
+# # HTTPS only; a query string is fine, credentials/fragment are not.
+# url = "https://example.com/feed.xml"
+# # Must name an existing table in [routes].
+# fleet = "default"
+# # How often to poll. Range 60-86400 (seconds).
+# poll_seconds = 900
+# # Caps notifications enqueued from a single poll, so a feed reset or
+# # large backfill can't flood a fleet. Range 0-50; 0 means the default (20).
+# # max_items = 10

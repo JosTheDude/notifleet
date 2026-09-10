@@ -1,0 +1,10 @@
+/.env
+/.env.*
+!/.env.example
+/config.json
+/config.toml
+/data/
+/notifleet
+/coverage.out
+*.test
+.DS_Store
