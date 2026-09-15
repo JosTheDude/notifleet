@@ -25,26 +25,28 @@ webhook_url = "env:DISCORD_WEBHOOK_URL"
 
 [routes]
 default = ["discord"]
+urgent = ["discord"]
+personal = ["discord"]
 
 # --- Optional server settings -----------------------------------------------
 # All have defaults; uncomment only to change one.
 
 # Maximum stored jobs (pending + not-yet-pruned terminal) before new
 # notifications are rejected with 503. Range 1-100000.
-# max_jobs = 10000
+max_jobs = 10000
 
 # Maximum delivery attempts per destination before a target is marked
 # failed. Range 1-10.
-# max_attempts = 5
+max_attempts = 5
 
 # How long a fully-delivered/failed job's record is kept on disk before
 # being pruned. Pending jobs are never pruned regardless of age.
 # Range 1-720 (hours).
-# retention_hours = 24
+retention_hours = 72
 
 # Shared token-bucket rate limit across all API keys combined, applied to
 # every endpoint except /healthz. Range 1-60000.
-# requests_per_minute = 120
+requests_per_minute = 120
 
 # --- Optional destinations --------------------------------------------------
 # Add only the ones you use; each must be listed in a route below to
