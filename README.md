@@ -1,5 +1,8 @@
 # Notifleet
 
+[![CI](https://github.com/JosTheDude/notifleet/actions/workflows/ci.yml/badge.svg)](https://github.com/JosTheDude/notifleet/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 A small, self-hosted notification router. Applications send one authenticated JSON request; Notifleet queues it durably and fans it out to the destinations in a named route.
 
 **One Go service with TOML configuration.** No database server, Redis, frontend, or account system. Runs continuously on your own machine, NAS, or VPS, either as a native Linux/macOS process or in Docker. The only application library dependency is `go-toml/v2`, compiled into the binary.
@@ -16,12 +19,29 @@ A small, self-hosted notification router. Applications send one authenticated JS
 
 Routes **fan out to every listed destination**, rather than round-robin between platforms. Multiple destinations can use the same provider, such as different Discord channels.
 
+## Project layout
+
+Standard Go layout: a thin entrypoint over independently testable internal packages, none of which are importable outside this module.
+
+```text
+cmd/notifleet/     entrypoint: flags, HTTP listener, worker/feed lifecycle, shutdown
+internal/config/   TOML loading, defaults, secret resolution, validation
+internal/server/   JSON API: auth, rate limiting, message validation, receipts
+internal/providers/  per-destination requests/responses, hardened HTTP client
+internal/queue/    durable job storage, delivery worker, retries
+internal/feeds/    RSS/Atom polling and feed-to-fleet notification
+configs/           config.example.toml reference
+.github/workflows/ CI: gofmt, vet, race tests, build, govulncheck, Docker build
+```
+
+Each package under `internal/` has its own `*_test.go` suite alongside it. See `AGENTS.md` for the package dependency graph and what each layer owns.
+
 ## Start with Docker Compose
 
 1. Prepare configuration and secrets:
 
    ```sh
-   cp config.example.toml config.toml
+   cp configs/config.example.toml config.toml
    cp .env.example .env
    chmod 600 .env
    openssl rand -hex 32
@@ -136,7 +156,7 @@ If you need to consume a feed some other way (custom filtering, transformation, 
 
 ## Configure providers and routes
 
-Use `config.example.toml` as a reference: it ships with one active Discord destination/route and every other option — server settings, the other providers, and feeds — present but commented out with an explanation of what it does and its valid range. Uncomment only what you need into `config.toml`, fill in secrets/settings, and add destination names to routes:
+Use `configs/config.example.toml` as a reference: it ships with one active Discord destination/route and every other option — server settings, the other providers, and feeds — present but commented out with an explanation of what it does and its valid range. Uncomment only what you need into `config.toml`, fill in secrets/settings, and add destination names to routes:
 
 ```toml
 [routes]
@@ -199,7 +219,7 @@ Requires Go 1.26.7+ and Linux/macOS. The minimum includes standard-library secur
 go test -race -cover ./...
 go vet ./...
 go run golang.org/x/vuln/cmd/govulncheck@latest ./...
-go build -trimpath -o notifleet .
+go build -trimpath -o notifleet ./cmd/notifleet
 ./notifleet -config config.toml -check
 ./notifleet -config config.toml
 ```

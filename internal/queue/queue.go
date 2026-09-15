@@ -1,4 +1,7 @@
-package main
+// Package queue persists notification jobs to disk and delivers them with
+// bounded retries. One exclusive writer owns a data directory; delivery runs
+// on a single worker so a slow provider never blocks another.
+package queue
 
 import (
 	"context"
@@ -16,11 +19,19 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"notifleet/internal/config"
+	"notifleet/internal/providers"
 )
 
 var idPattern = regexp.MustCompile(`^[a-f0-9]{32}$`)
-var errFull = errors.New("queue capacity reached")
-var errStorage = errors.New("storage unavailable")
+
+// ErrFull is returned by Enqueue when the queue is at max_jobs capacity.
+var ErrFull = errors.New("queue capacity reached")
+
+// ErrStorage is returned when the durable store cannot be written; the
+// queue is poisoned (see Healthy) and stops accepting or delivering work.
+var ErrStorage = errors.New("storage unavailable")
 
 type Target struct {
 	Name        string    `json:"name"`
@@ -32,23 +43,26 @@ type Target struct {
 }
 
 type Job struct {
-	ID          string     `json:"id"`
-	CreatedAt   time.Time  `json:"created_at"`
-	CompletedAt *time.Time `json:"completed_at,omitempty"`
-	Payload     Message    `json:"payload"`
-	Targets     []Target   `json:"targets"`
+	ID          string            `json:"id"`
+	CreatedAt   time.Time         `json:"created_at"`
+	CompletedAt *time.Time        `json:"completed_at,omitempty"`
+	Payload     providers.Message `json:"payload"`
+	Targets     []Target          `json:"targets"`
 }
 
 type Queue struct {
 	mu        sync.Mutex
-	config    Config
+	config    config.Config
 	jobs      map[string]*Job
 	cooldowns map[string]time.Time
 	lock      *os.File
 	unhealthy bool
 }
 
-func openQueue(c Config) (*Queue, error) {
+// Open acquires the exclusive lock on c.DataDir, loads any existing queue
+// records, and prunes terminal jobs past retention. It fails closed on any
+// corrupt or invalid record rather than silently dropping it.
+func Open(c config.Config) (*Queue, error) {
 	if err := os.MkdirAll(c.DataDir, 0700); err != nil {
 		return nil, err
 	}
@@ -66,7 +80,7 @@ func openQueue(c Config) (*Queue, error) {
 	q := &Queue{config: c, jobs: map[string]*Job{}, cooldowns: map[string]time.Time{}, lock: lock}
 	entries, err := os.ReadDir(c.DataDir)
 	if err != nil {
-		q.close()
+		q.Close()
 		return nil, err
 	}
 	for _, entry := range entries {
@@ -76,17 +90,17 @@ func openQueue(c Config) (*Queue, error) {
 		}
 		data, err := os.ReadFile(filepath.Join(c.DataDir, name))
 		if err != nil {
-			q.close()
+			q.Close()
 			return nil, err
 		}
 		var job Job
 		if json.Unmarshal(data, &job) != nil || !idPattern.MatchString(job.ID) || name != job.ID+".json" || job.CreatedAt.IsZero() || len(job.Targets) == 0 {
-			q.close()
+			q.Close()
 			return nil, fmt.Errorf("corrupt queue record %s; restore from backup before restarting", name)
 		}
 		for _, target := range job.Targets {
-			if !namePattern.MatchString(target.Name) || (target.State != "pending" && target.State != "delivered" && target.State != "failed") || target.Attempts < 0 || target.Attempts > 10 || target.NextAttempt.IsZero() {
-				q.close()
+			if !config.NamePattern.MatchString(target.Name) || (target.State != "pending" && target.State != "delivered" && target.State != "failed") || target.Attempts < 0 || target.Attempts > 10 || target.NextAttempt.IsZero() {
+				q.Close()
 				return nil, fmt.Errorf("invalid target in queue record %s", name)
 			}
 			if target.Code == "http_429" && target.NextAttempt.After(q.cooldowns[target.Fingerprint]) {
@@ -96,17 +110,56 @@ func openQueue(c Config) (*Queue, error) {
 		q.jobs[job.ID] = &job
 	}
 	if err := q.prune(time.Now()); err != nil {
-		q.close()
+		q.Close()
 		return nil, err
 	}
 	if len(q.jobs) > c.MaxJobs {
-		q.close()
+		q.Close()
 		return nil, errors.New("stored jobs exceed max_jobs; increase the configured limit")
 	}
 	return q, nil
 }
 
-func (q *Queue) close() { q.lock.Close() }
+func (q *Queue) Close() { q.lock.Close() }
+
+// Healthy reports whether the queue can still accept and deliver work. A
+// storage failure poisons the queue permanently for the life of this handle.
+func (q *Queue) Healthy() bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return !q.unhealthy
+}
+
+// Job returns a snapshot of one stored job. Never expose message content,
+// destination fingerprints, or endpoints to a caller outside this package
+// from the returned value without deliberate filtering.
+func (q *Queue) Job(id string) (Job, bool) {
+	if !idPattern.MatchString(id) {
+		return Job{}, false
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	j, ok := q.jobs[id]
+	if !ok {
+		return Job{}, false
+	}
+	cp := *j
+	cp.Targets = append([]Target(nil), j.Targets...)
+	return cp, true
+}
+
+// Jobs returns a snapshot of every stored job, for observability and tests.
+func (q *Queue) Jobs() []Job {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	out := make([]Job, 0, len(q.jobs))
+	for _, j := range q.jobs {
+		cp := *j
+		cp.Targets = append([]Target(nil), j.Targets...)
+		out = append(out, cp)
+	}
+	return out
+}
 
 func syncDirectory(path string) error {
 	f, err := os.Open(path)
@@ -167,17 +220,26 @@ func (q *Queue) prune(now time.Time) error {
 	return nil
 }
 
-func (q *Queue) enqueue(m Message) (string, error) {
+// Prune removes terminal jobs past retention as of now. Open and Enqueue
+// already call this; it is exported mainly so tests can exercise retention
+// boundaries deterministically without waiting on real time.
+func (q *Queue) Prune(now time.Time) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.prune(now)
+}
+
+func (q *Queue) Enqueue(m providers.Message) (string, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.unhealthy {
-		return "", errStorage
+		return "", ErrStorage
 	}
 	if err := q.prune(time.Now()); err != nil {
-		return "", errStorage
+		return "", ErrStorage
 	}
 	if len(q.jobs) >= q.config.MaxJobs {
-		return "", errFull
+		return "", ErrFull
 	}
 	idBytes := make([]byte, 16)
 	if _, err := rand.Read(idBytes); err != nil {
@@ -186,25 +248,26 @@ func (q *Queue) enqueue(m Message) (string, error) {
 	now := time.Now().UTC()
 	job := &Job{ID: hex.EncodeToString(idBytes), CreatedAt: now, Payload: m}
 	for _, name := range q.config.Routes[m.Route] {
-		job.Targets = append(job.Targets, Target{Name: name, Fingerprint: q.config.Destinations[name].fingerprint(), State: "pending", NextAttempt: now})
+		job.Targets = append(job.Targets, Target{Name: name, Fingerprint: q.config.Destinations[name].Fingerprint(), State: "pending", NextAttempt: now})
 	}
 	if len(job.Targets) == 0 {
 		return "", errors.New("unknown route")
 	}
 	if err := q.save(job); err != nil {
-		return "", errStorage
+		return "", ErrStorage
 	}
 	q.jobs[job.ID] = job
 	return job.ID, nil
 }
 
-// Single worker keeps provider concurrency bounded. Requests run outside the
-// queue lock, so a slow provider never blocks ingress or status requests.
+// step processes at most one ready delivery attempt. Single worker keeps
+// provider concurrency bounded. Requests run outside the queue lock, so a
+// slow provider never blocks ingress or status requests.
 func (q *Queue) step(ctx context.Context, clients map[bool]*http.Client, now time.Time) (bool, error) {
 	q.mu.Lock()
 	if q.unhealthy {
 		q.mu.Unlock()
-		return false, errStorage
+		return false, ErrStorage
 	}
 	if err := q.prune(now); err != nil {
 		q.mu.Unlock()
@@ -228,8 +291,8 @@ func (q *Queue) step(ctx context.Context, clients map[bool]*http.Client, now tim
 	}
 	target := &job.Targets[index]
 	d, exists := q.config.Destinations[target.Name]
-	valid := exists && d.fingerprint() == target.Fingerprint
-	result := DeliveryResult{Code: "destination_changed"}
+	valid := exists && d.Fingerprint() == target.Fingerprint
+	result := providers.DeliveryResult{Code: "destination_changed"}
 	if valid && target.Attempts >= q.config.MaxAttempts {
 		valid = false
 		result.Code = "attempts_exhausted"
@@ -244,7 +307,7 @@ func (q *Queue) step(ctx context.Context, clients map[bool]*http.Client, now tim
 	}
 	q.mu.Unlock()
 	if valid {
-		result = deliver(ctx, clients[d.AllowPrivateNetwork], d, job.Payload)
+		result = providers.Deliver(ctx, clients[d.AllowPrivateNetwork], d, job.Payload)
 	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -282,8 +345,16 @@ func (q *Queue) step(ctx context.Context, clients map[bool]*http.Client, now tim
 	return true, nil
 }
 
-func (q *Queue) run(ctx context.Context) error {
-	clients := map[bool]*http.Client{false: newDeliveryClient(false), true: newDeliveryClient(true)}
+// Deliver processes exactly one ready delivery attempt using the given
+// per-network-mode HTTP clients and clock. Run already calls this in a
+// loop with real clients and the real clock; it is exported so tests can
+// control provider mocking and time deterministically.
+func (q *Queue) Deliver(ctx context.Context, clients map[bool]*http.Client, now time.Time) (bool, error) {
+	return q.step(ctx, clients, now)
+}
+
+func (q *Queue) Run(ctx context.Context) error {
+	clients := map[bool]*http.Client{false: providers.NewDeliveryClient(false), true: providers.NewDeliveryClient(true)}
 	defer clients[false].CloseIdleConnections()
 	defer clients[true].CloseIdleConnections()
 	ticker := time.NewTicker(250 * time.Millisecond)

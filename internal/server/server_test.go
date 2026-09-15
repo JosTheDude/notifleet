@@ -1,4 +1,4 @@
-package main
+package server_test
 
 import (
 	"encoding/json"
@@ -7,11 +7,19 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"notifleet/internal/config"
+	"notifleet/internal/queue"
+	"notifleet/internal/server"
 )
 
-func testConfig(t *testing.T) Config {
+func testConfig(t *testing.T) config.Config {
 	t.Helper()
-	return Config{DataDir: t.TempDir(), APIKeys: []string{strings.Repeat("a", 64)}, MaxJobs: 100, MaxAttempts: 3, RetentionHours: 24, RequestsPerMinute: 1000, Destinations: map[string]Destination{"chat": {Provider: "discord", WebhookURL: "https://discord.com/api/webhooks/123/token"}}, Routes: map[string][]string{"default": {"chat"}, "alerts": {"chat"}}}
+	return config.Config{
+		DataDir: t.TempDir(), APIKeys: []string{strings.Repeat("a", 64)}, MaxJobs: 100, MaxAttempts: 3, RetentionHours: 24, RequestsPerMinute: 1000,
+		Destinations: map[string]config.Destination{"chat": {Provider: "discord", WebhookURL: "https://discord.com/api/webhooks/123/token"}},
+		Routes:       map[string][]string{"default": {"chat"}, "alerts": {"chat"}},
+	}
 }
 
 func request(h http.Handler, method, path, body, key string) *httptest.ResponseRecorder {
@@ -27,12 +35,12 @@ func request(h http.Handler, method, path, body, key string) *httptest.ResponseR
 
 func TestAPI(t *testing.T) {
 	c := testConfig(t)
-	q, err := openQueue(c)
+	q, err := queue.Open(c)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer q.close()
-	h := newHandler(c, q)
+	defer q.Close()
+	h := server.NewHandler(c, q)
 	for _, tc := range []struct {
 		method, path, body, key string
 		status                  int
@@ -47,6 +55,7 @@ func TestAPI(t *testing.T) {
 		{"POST", "/v1/notify", `null`, c.APIKeys[0], 422},
 		{"POST", "/v1/notify", `{"message":"  "}`, c.APIKeys[0], 422},
 		{"POST", "/v1/notify", `{"message":"hello","route":"missing"}`, c.APIKeys[0], 422},
+		{"POST", "/v1/notify", `{"title":"` + strings.Repeat("t", 251) + `","message":"hello"}`, c.APIKeys[0], 422},
 		{"POST", "/v1/webhooks/alerts", `{"message":"hello","route":"default"}`, c.APIKeys[0], 400},
 		{"POST", "/v1/notify", strings.Repeat("x", 32769), c.APIKeys[0], 413},
 		{"POST", "/v1/notify", "{\"message\":\"\xff\"}", c.APIKeys[0], 400},
@@ -57,7 +66,7 @@ func TestAPI(t *testing.T) {
 			t.Errorf("%s %s: got %d want %d: %s", tc.method, tc.path, w.Code, tc.status, w.Body)
 		}
 	}
-	if len(q.jobs) != 0 {
+	if len(q.Jobs()) != 0 {
 		t.Fatal("invalid requests queued messages")
 	}
 	w := request(h, "POST", "/v1/webhooks/alerts", `{"title":"Test","message":"confidential-content"}`, c.APIKeys[0])
@@ -67,7 +76,8 @@ func TestAPI(t *testing.T) {
 	var accepted map[string]string
 	json.Unmarshal(w.Body.Bytes(), &accepted)
 	id := accepted["id"]
-	if !idPattern.MatchString(id) || q.jobs[id].Payload.Route != "alerts" {
+	job, ok := q.Job(id)
+	if !ok || job.Payload.Route != "alerts" {
 		t.Fatal(accepted)
 	}
 	status := request(h, "GET", w.Header().Get("Location"), "", c.APIKeys[0])
@@ -84,9 +94,9 @@ func TestAPI(t *testing.T) {
 	}
 	r := httptest.NewRequest("POST", "/v1/notify", strings.NewReader(`{"message":"hello"}`))
 	r.Header.Set("Authorization", "Bearer "+c.APIKeys[0])
-	w = httptest.NewRecorder()
-	h.ServeHTTP(w, r)
-	if w.Code != 415 {
+	w2 := httptest.NewRecorder()
+	h.ServeHTTP(w2, r)
+	if w2.Code != 415 {
 		t.Fatal("accepted non-JSON content type")
 	}
 }
@@ -95,12 +105,12 @@ func TestRateLimitAndKeyRotation(t *testing.T) {
 	c := testConfig(t)
 	c.RequestsPerMinute = 1
 	c.APIKeys = append(c.APIKeys, strings.Repeat("b", 64))
-	q, err := openQueue(c)
+	q, err := queue.Open(c)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer q.close()
-	h := newHandler(c, q)
+	defer q.Close()
+	h := server.NewHandler(c, q)
 	if request(h, "POST", "/v1/notify", `{"message":"one"}`, c.APIKeys[1]).Code != 202 {
 		t.Fatal("second key rejected")
 	}
@@ -112,40 +122,14 @@ func TestRateLimitAndKeyRotation(t *testing.T) {
 	}
 }
 
-func TestMessageBoundaries(t *testing.T) {
-	for _, tc := range []struct {
-		provider, title, body string
-		valid                 bool
-	}{
-		{"discord", "", strings.Repeat("😀", 1000), true},
-		{"discord", "A", strings.Repeat("😀", 999), false},
-		{"slack", "", strings.Repeat("a", 3000), true},
-		{"slack", "", strings.Repeat("a", 3001), false},
-		{"telegram", "", strings.Repeat("a", 4096), true},
-		{"telegram", "A", strings.Repeat("a", 4096), false},
-		{"pushover", "", strings.Repeat("界", 1024), true},
-		{"pushover", "", strings.Repeat("界", 1025), false},
-		{"ntfy", "", strings.Repeat("\n", 2100), false},
-		{"ntfy", "", "hello", true},
-		{"discord", strings.Repeat("t", 251), "hello", false},
-	} {
-		c := testConfig(t)
-		c.Destinations["chat"] = Destination{Provider: tc.provider, Topic: "test"}
-		err := validateMessage(Message{Route: "default", Title: tc.title, Message: tc.body}, c)
-		if (err == nil) != tc.valid {
-			t.Errorf("%s boundary: %v", tc.provider, err)
-		}
-	}
-}
-
 func TestConcurrentIngress(t *testing.T) {
 	c := testConfig(t)
-	q, err := openQueue(c)
+	q, err := queue.Open(c)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer q.close()
-	h := newHandler(c, q)
+	defer q.Close()
+	h := server.NewHandler(c, q)
 	var wg sync.WaitGroup
 	for range 20 {
 		wg.Go(func() {
@@ -156,7 +140,7 @@ func TestConcurrentIngress(t *testing.T) {
 		})
 	}
 	wg.Wait()
-	if len(q.jobs) != 20 {
-		t.Fatalf("lost jobs: %d", len(q.jobs))
+	if len(q.Jobs()) != 20 {
+		t.Fatalf("lost jobs: %d", len(q.Jobs()))
 	}
 }

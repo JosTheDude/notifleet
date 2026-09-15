@@ -1,10 +1,14 @@
-package main
+// Package providers builds and sends outbound requests to each supported
+// destination, and validates that a message fits every provider it will be
+// routed to.
+package providers
 
 import (
 	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -13,10 +17,24 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf16"
+	"unicode/utf8"
+
+	"notifleet/internal/config"
 )
 
-// Block non-public addresses at dial time, after DNS resolution. Dial the
-// checked IP itself to avoid DNS-rebinding races. Environment proxies are off.
+var (
+	errUnknownRoute  = errors.New("unknown route")
+	errDiscordLimit  = errors.New("Discord message exceeds 2000 UTF-16 units including title")
+	errSlackLimit    = errors.New("Slack message exceeds 3000 UTF-16 units including title")
+	errTelegramLimit = errors.New("Telegram message exceeds 4096 UTF-16 units including title")
+	errPushoverLimit = errors.New("Pushover message exceeds 1024 characters")
+	errNtfyLimit     = errors.New("ntfy JSON payload exceeds 4096 bytes")
+)
+
+// publicIP blocks non-public addresses at dial time, after DNS resolution.
+// Dial the checked IP itself to avoid DNS-rebinding races. Environment
+// proxies are off.
 func publicIP(ip netip.Addr) bool {
 	ip = ip.Unmap()
 	if !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
@@ -33,7 +51,13 @@ func publicIP(ip netip.Addr) bool {
 	return true
 }
 
-func newDeliveryClient(allowPrivate bool) *http.Client {
+// NewDeliveryClient returns an HTTP client hardened against SSRF: it dials
+// only public IPs unless allowPrivate is set (for a trusted self-hosted
+// ntfy destination), refuses to follow redirects so a compromised or
+// misconfigured endpoint cannot exfiltrate a bearer token via 3xx, and
+// disables environment proxies. Feed fetches use the same client with
+// allowPrivate always false.
+func NewDeliveryClient(allowPrivate bool) *http.Client {
 	tr := &http.Transport{
 		TLSClientConfig:        &tls.Config{MinVersion: tls.VersionTLS12},
 		TLSHandshakeTimeout:    5 * time.Second,
@@ -83,7 +107,45 @@ func (m Message) text() string {
 	return m.Title + "\n\n" + m.Message
 }
 
-func providerRequest(ctx context.Context, d Destination, m Message) (*http.Request, error) {
+// ValidateMessage rejects a message that would exceed any provider's limit
+// among the destinations its route targets, rather than silently truncating
+// it. c.Routes[m.Route] must already be known to exist to the caller (an
+// unknown route is itself rejected here too).
+func ValidateMessage(m Message, c config.Config) error {
+	targets, ok := c.Routes[m.Route]
+	if !ok {
+		return errUnknownRoute
+	}
+	for _, name := range targets {
+		d := c.Destinations[name]
+		switch d.Provider {
+		case "discord":
+			if len(utf16.Encode([]rune(m.text()))) > 2000 {
+				return errDiscordLimit
+			}
+		case "slack":
+			if len(utf16.Encode([]rune(m.text()))) > 3000 {
+				return errSlackLimit
+			}
+		case "telegram":
+			if len(utf16.Encode([]rune(m.text()))) > 4096 {
+				return errTelegramLimit
+			}
+		case "pushover":
+			if utf8.RuneCountInString(m.Message) > 1024 {
+				return errPushoverLimit
+			}
+		case "ntfy":
+			body, _ := json.Marshal(map[string]any{"topic": d.Topic, "title": m.Title, "message": m.Message})
+			if len(body) > 4096 {
+				return errNtfyLimit
+			}
+		}
+	}
+	return nil
+}
+
+func providerRequest(ctx context.Context, d config.Destination, m Message) (*http.Request, error) {
 	endpoint, contentType := d.WebhookURL, "application/json"
 	var payload any
 	var body []byte
@@ -137,7 +199,8 @@ func retryAfter(raw string, now time.Time) time.Duration {
 	return 0
 }
 
-func deliver(ctx context.Context, client *http.Client, d Destination, m Message) DeliveryResult {
+// Deliver sends one message to one destination and classifies the outcome.
+func Deliver(ctx context.Context, client *http.Client, d config.Destination, m Message) DeliveryResult {
 	r, err := providerRequest(ctx, d, m)
 	if err != nil {
 		return DeliveryResult{Code: "invalid_destination"}

@@ -1,4 +1,6 @@
-package main
+// Package feeds polls RSS 2.0 and Atom URLs and pushes new items into a
+// fleet (an existing configured route) as ordinary notifications.
+package feeds
 
 import (
 	"context"
@@ -15,6 +17,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"notifleet/internal/config"
+	"notifleet/internal/providers"
+	"notifleet/internal/queue"
 )
 
 var htmlTagPattern = regexp.MustCompile(`<[^>]*>`)
@@ -117,7 +123,7 @@ func truncateRunes(s string, n int) string {
 	return string(r[:n-1]) + "…"
 }
 
-func feedMessage(feedName string, feed Feed, item feedItem) Message {
+func feedMessage(feedName string, feed config.Feed, item feedItem) providers.Message {
 	title := truncateRunes(firstNonEmpty(strings.TrimSpace(item.title), feedName), 120)
 	body := truncateRunes(stripHTML(item.body), 600)
 	if item.link != "" {
@@ -129,7 +135,7 @@ func feedMessage(feedName string, feed Feed, item feedItem) Message {
 	if body == "" {
 		body = feedName
 	}
-	return Message{Route: feed.Fleet, Title: title, Message: body}
+	return providers.Message{Route: feed.Fleet, Title: title, Message: body}
 }
 
 type feedState struct {
@@ -156,8 +162,18 @@ func loadFeedState(dataDir, name string) (feedState, error) {
 	return st, nil
 }
 
+func syncDirectory(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
+}
+
 // saveFeedState uses the same atomic temp-file-then-rename-plus-fsync pattern
-// as Queue.save so feed dedup state survives a crash without corruption.
+// as the queue package's job persistence so feed dedup state survives a
+// crash without corruption.
 func saveFeedState(dataDir, name string, st feedState) error {
 	dir := filepath.Join(dataDir, "feeds")
 	if err := os.MkdirAll(dir, 0700); err != nil {
@@ -192,7 +208,7 @@ const maxSeenItems = 2000
 // seen set (no backfill notification flood). Items are marked seen only
 // after a successful enqueue, so a crash mid-poll causes at most a duplicate
 // notification on the next poll, never a silently dropped one.
-func pollFeed(ctx context.Context, client *http.Client, c Config, name string, feed Feed, q *Queue) {
+func pollFeed(ctx context.Context, client *http.Client, c config.Config, name string, feed config.Feed, q *queue.Queue) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, feed.URL, nil)
 	if err != nil {
 		slog.Error("feed request build failed", "feed", name, "error", err.Error())
@@ -251,12 +267,12 @@ func pollFeed(ctx context.Context, client *http.Client, c Config, name string, f
 				break
 			}
 			m := feedMessage(name, feed, it)
-			if err := validateMessage(m, c); err != nil {
+			if err := providers.ValidateMessage(m, c); err != nil {
 				slog.Warn("feed item skipped", "feed", name, "error", err.Error())
 				toMark = append(toMark, it.id)
 				continue
 			}
-			if _, err := q.enqueue(m); err != nil {
+			if _, err := q.Enqueue(m); err != nil {
 				slog.Error("feed item enqueue failed", "feed", name, "error", err.Error())
 				continue
 			}
@@ -281,19 +297,19 @@ func pollFeed(ctx context.Context, client *http.Client, c Config, name string, f
 	}
 }
 
-// runFeeds polls every configured feed on its own interval until ctx is
+// Run polls every configured feed on its own interval until ctx is
 // cancelled. It uses the same public-IP-only, no-redirect delivery client as
 // provider sends, so feed fetches get identical SSRF/TLS protections.
-func runFeeds(ctx context.Context, c Config, q *Queue) {
+func Run(ctx context.Context, c config.Config, q *queue.Queue) {
 	if len(c.Feeds) == 0 {
 		return
 	}
-	client := newDeliveryClient(false)
+	client := providers.NewDeliveryClient(false)
 	defer client.CloseIdleConnections()
 	var wg sync.WaitGroup
 	for name, feed := range c.Feeds {
 		wg.Add(1)
-		go func(name string, feed Feed) {
+		go func(name string, feed config.Feed) {
 			defer wg.Done()
 			pollFeed(ctx, client, c, name, feed, q)
 			ticker := time.NewTicker(time.Duration(feed.PollSeconds) * time.Second)

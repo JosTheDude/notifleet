@@ -1,6 +1,8 @@
 *
 !go.mod
 !go.sum
-!*.go
-!*_test.go
+!cmd
+!cmd/**
+!internal
+!internal/**
 !Dockerfile

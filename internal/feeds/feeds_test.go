@@ -1,4 +1,4 @@
-package main
+package feeds
 
 import (
 	"context"
@@ -7,7 +7,19 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"notifleet/internal/config"
+	"notifleet/internal/queue"
 )
+
+func testConfig(t *testing.T) config.Config {
+	t.Helper()
+	return config.Config{
+		Listen: "127.0.0.1:0", DataDir: t.TempDir(), MaxJobs: 100, MaxAttempts: 5, RetentionHours: 24, RequestsPerMinute: 120,
+		Destinations: map[string]config.Destination{"chat": {Provider: "discord", WebhookURL: "https://discord.com/api/webhooks/1/x"}},
+		Routes:       map[string][]string{"default": {"chat"}},
+	}
+}
 
 func TestParseFeedRSS(t *testing.T) {
 	doc := `<?xml version="1.0"?>
@@ -92,17 +104,17 @@ func TestPollFeedPrimesWithoutNotifying(t *testing.T) {
 
 	c := testConfig(t)
 	dir := c.DataDir
-	q, err := openQueue(c)
+	q, err := queue.Open(c)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer q.close()
+	defer q.Close()
 
-	feed := Feed{URL: srv.URL, Fleet: "default", PollSeconds: 60, MaxItems: 10}
+	feed := config.Feed{URL: srv.URL, Fleet: "default", PollSeconds: 60, MaxItems: 10}
 	pollFeed(context.Background(), srv.Client(), c, "news", feed, q)
 
-	if len(q.jobs) != 0 {
-		t.Fatalf("first poll should only prime state, got %d jobs", len(q.jobs))
+	if len(q.Jobs()) != 0 {
+		t.Fatalf("first poll should only prime state, got %d jobs", len(q.Jobs()))
 	}
 	st, err := loadFeedState(dir, "news")
 	if err != nil {
@@ -120,14 +132,14 @@ func TestPollFeedPrimesWithoutNotifying(t *testing.T) {
 </channel></rss>`))
 	})
 	pollFeed(context.Background(), srv.Client(), c, "news", feed, q)
-	if len(q.jobs) != 1 {
-		t.Fatalf("expected 1 enqueued job, got %d", len(q.jobs))
+	if len(q.Jobs()) != 1 {
+		t.Fatalf("expected 1 enqueued job, got %d", len(q.Jobs()))
 	}
 
 	// Polling again with the same items should not duplicate.
 	pollFeed(context.Background(), srv.Client(), c, "news", feed, q)
-	if len(q.jobs) != 1 {
-		t.Fatalf("expected dedup, still 1 job, got %d", len(q.jobs))
+	if len(q.Jobs()) != 1 {
+		t.Fatalf("expected dedup, still 1 job, got %d", len(q.Jobs()))
 	}
 }
 
@@ -139,12 +151,12 @@ func TestPollFeedRespectsMaxItems(t *testing.T) {
 	defer srv.Close()
 
 	c := testConfig(t)
-	q, err := openQueue(c)
+	q, err := queue.Open(c)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer q.close()
-	feed := Feed{URL: srv.URL, Fleet: "default", PollSeconds: 60, MaxItems: 1}
+	defer q.Close()
+	feed := config.Feed{URL: srv.URL, Fleet: "default", PollSeconds: 60, MaxItems: 1}
 	pollFeed(context.Background(), srv.Client(), c, "news", feed, q) // prime
 
 	srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -155,20 +167,20 @@ func TestPollFeedRespectsMaxItems(t *testing.T) {
 </channel></rss>`))
 	})
 	pollFeed(context.Background(), srv.Client(), c, "news", feed, q)
-	if len(q.jobs) != 1 {
-		t.Fatalf("max_items=1 should cap enqueue at 1, got %d", len(q.jobs))
+	if len(q.Jobs()) != 1 {
+		t.Fatalf("max_items=1 should cap enqueue at 1, got %d", len(q.Jobs()))
 	}
 }
 
-func TestRunFeedsStopsOnContextCancel(t *testing.T) {
+func TestRunStopsOnContextCancel(t *testing.T) {
 	c := testConfig(t)
-	c.Feeds = map[string]Feed{}
-	q, err := openQueue(c)
+	c.Feeds = map[string]config.Feed{}
+	q, err := queue.Open(c)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer q.close()
+	defer q.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	runFeeds(ctx, c, q) // no feeds configured: should return immediately
+	Run(ctx, c, q) // no feeds configured: should return immediately
 }

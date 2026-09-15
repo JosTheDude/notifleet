@@ -1,4 +1,4 @@
-package main
+package config
 
 import (
 	"os"
@@ -44,7 +44,7 @@ default = ["chat"]
 			if err := os.WriteFile(path, []byte(tc.data), 0600); err != nil {
 				t.Fatal(err)
 			}
-			c, err := loadConfig(path)
+			c, err := Load(path)
 			if (err == nil) != tc.valid {
 				t.Fatalf("valid=%v error=%v", tc.valid, err)
 			}
@@ -90,7 +90,7 @@ poll_seconds = 300
 			if err := os.WriteFile(path, []byte(tc.data), 0600); err != nil {
 				t.Fatal(err)
 			}
-			_, err := loadConfig(path)
+			_, err := Load(path)
 			if (err == nil) != tc.valid {
 				t.Fatalf("valid=%v error=%v", tc.valid, err)
 			}
@@ -156,7 +156,7 @@ default = ["lan"]
 	if err := os.WriteFile(path, []byte(data), 0600); err != nil {
 		t.Fatal(err)
 	}
-	c, err := loadConfig(path)
+	c, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}

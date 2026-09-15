@@ -1,4 +1,6 @@
-package main
+// Package server implements Notifleet's JSON API: bearer auth, rate
+// limiting, message validation, and sanitized delivery receipts.
+package server
 
 import (
 	"crypto/sha256"
@@ -11,9 +13,24 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf16"
 	"unicode/utf8"
+
+	"notifleet/internal/config"
+	"notifleet/internal/providers"
+	"notifleet/internal/queue"
 )
+
+func decodeStrict(r io.Reader, v any) error {
+	d := json.NewDecoder(r)
+	d.DisallowUnknownFields()
+	if err := d.Decode(v); err != nil {
+		return err
+	}
+	if err := d.Decode(new(any)); err != io.EOF {
+		return errors.New("expected exactly one JSON object")
+	}
+	return nil
+}
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -25,45 +42,16 @@ func apiError(w http.ResponseWriter, status int, code string) {
 	writeJSON(w, status, map[string]string{"error": code})
 }
 
-func validateMessage(m Message, c Config) error {
-	if strings.TrimSpace(m.Message) == "" || !utf8.ValidString(m.Message) || !utf8.ValidString(m.Title) || utf8.RuneCountInString(m.Title) > 250 || len(m.Message) > 16000 || strings.ContainsRune(m.text(), '\x00') {
+func validateMessage(m providers.Message, c config.Config) error {
+	if strings.TrimSpace(m.Message) == "" || !utf8.ValidString(m.Message) || !utf8.ValidString(m.Title) || utf8.RuneCountInString(m.Title) > 250 || len(m.Message) > 16000 || strings.ContainsRune(m.Message, '\x00') || strings.ContainsRune(m.Title, '\x00') {
 		return errors.New("invalid message")
 	}
-	targets, ok := c.Routes[m.Route]
-	if !ok {
-		return errors.New("unknown route")
-	}
-	// Reject over-limit input rather than silently truncating notifications.
-	for _, name := range targets {
-		d := c.Destinations[name]
-		switch d.Provider {
-		case "discord":
-			if len(utf16.Encode([]rune(m.text()))) > 2000 {
-				return errors.New("Discord message exceeds 2000 UTF-16 units including title")
-			}
-		case "slack":
-			if len(utf16.Encode([]rune(m.text()))) > 3000 {
-				return errors.New("Slack message exceeds 3000 UTF-16 units including title")
-			}
-		case "telegram":
-			if len(utf16.Encode([]rune(m.text()))) > 4096 {
-				return errors.New("Telegram message exceeds 4096 UTF-16 units including title")
-			}
-		case "pushover":
-			if utf8.RuneCountInString(m.Message) > 1024 {
-				return errors.New("Pushover message exceeds 1024 characters")
-			}
-		case "ntfy":
-			body, _ := json.Marshal(map[string]any{"topic": d.Topic, "title": m.Title, "message": m.Message})
-			if len(body) > 4096 {
-				return errors.New("ntfy JSON payload exceeds 4096 bytes")
-			}
-		}
-	}
-	return nil
+	return providers.ValidateMessage(m, c)
 }
 
-func newHandler(c Config, q *Queue) http.Handler {
+// NewHandler builds the full Notifleet HTTP API, including bearer auth,
+// per-process rate limiting, and security headers on every response.
+func NewHandler(c config.Config, q *queue.Queue) http.Handler {
 	keys := make([][32]byte, len(c.APIKeys))
 	for i, key := range c.APIKeys {
 		keys[i] = sha256.Sum256([]byte(key))
@@ -72,10 +60,7 @@ func newHandler(c Config, q *Queue) http.Handler {
 	tokens, last := float64(c.RequestsPerMinute), time.Now()
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-		q.mu.Lock()
-		healthy := !q.unhealthy
-		q.mu.Unlock()
-		if !healthy {
+		if !q.Healthy() {
 			apiError(w, 503, "storage_unavailable")
 			return
 		}
@@ -98,7 +83,7 @@ func newHandler(c Config, q *Queue) http.Handler {
 			}
 			return
 		}
-		var m Message
+		var m providers.Message
 		if !utf8.Valid(body) || decodeStrict(strings.NewReader(string(body)), &m) != nil {
 			apiError(w, 400, "invalid_json")
 			return
@@ -117,7 +102,7 @@ func newHandler(c Config, q *Queue) http.Handler {
 			apiError(w, 422, err.Error())
 			return
 		}
-		id, err := q.enqueue(m)
+		id, err := q.Enqueue(m)
 		if err != nil {
 			apiError(w, 503, "queue_unavailable")
 			return
@@ -128,15 +113,8 @@ func newHandler(c Config, q *Queue) http.Handler {
 	mux.HandleFunc("POST /v1/notify", notify)
 	mux.HandleFunc("POST /v1/webhooks/{route}", notify)
 	mux.HandleFunc("GET /v1/notifications/{id}", func(w http.ResponseWriter, r *http.Request) {
-		id := r.PathValue("id")
-		if !idPattern.MatchString(id) {
-			apiError(w, 404, "not_found")
-			return
-		}
-		q.mu.Lock()
-		job, ok := q.jobs[id]
+		job, ok := q.Job(r.PathValue("id"))
 		if !ok {
-			q.mu.Unlock()
 			apiError(w, 404, "not_found")
 			return
 		}
@@ -162,9 +140,7 @@ func newHandler(c Config, q *Queue) http.Handler {
 		} else if failed > 0 {
 			state = "partial"
 		}
-		response := map[string]any{"id": job.ID, "status": state, "created_at": job.CreatedAt, "completed_at": job.CompletedAt, "targets": targets}
-		q.mu.Unlock()
-		writeJSON(w, 200, response)
+		writeJSON(w, 200, map[string]any{"id": job.ID, "status": state, "created_at": job.CreatedAt, "completed_at": job.CompletedAt, "targets": targets})
 	})
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")

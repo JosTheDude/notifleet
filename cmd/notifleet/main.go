@@ -1,3 +1,6 @@
+// Command notifleet runs the notification API/webhook service: it loads a
+// TOML configuration, opens the durable queue, starts the HTTP API and
+// delivery worker, and polls any configured RSS/Atom feeds.
 package main
 
 import (
@@ -12,6 +15,11 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+
+	"notifleet/internal/config"
+	"notifleet/internal/feeds"
+	"notifleet/internal/queue"
+	"notifleet/internal/server"
 )
 
 func run() error {
@@ -19,7 +27,7 @@ func run() error {
 	check := flag.Bool("check", false, "validate configuration and exit without opening the queue or sending messages")
 	healthcheck := flag.Bool("healthcheck", false, "check the local running service and exit")
 	flag.Parse()
-	c, err := loadConfig(*path)
+	c, err := config.Load(*path)
 	if err != nil {
 		return err
 	}
@@ -48,11 +56,11 @@ func run() error {
 		}
 		return nil
 	}
-	q, err := openQueue(c)
+	q, err := queue.Open(c)
 	if err != nil {
 		return err
 	}
-	defer q.close()
+	defer q.Close()
 	listener, err := net.Listen("tcp", c.Listen)
 	if err != nil {
 		return err
@@ -60,11 +68,11 @@ func run() error {
 	defer listener.Close()
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	server := &http.Server{Addr: c.Listen, Handler: newHandler(c, q), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
+	httpServer := &http.Server{Addr: c.Listen, Handler: server.NewHandler(c, q), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
 	workerDone, serverDone, feedsDone := make(chan error, 1), make(chan error, 1), make(chan struct{})
-	go func() { workerDone <- q.run(ctx) }()
-	go func() { serverDone <- server.Serve(listener) }()
-	go func() { runFeeds(ctx, c, q); close(feedsDone) }()
+	go func() { workerDone <- q.Run(ctx) }()
+	go func() { serverDone <- httpServer.Serve(listener) }()
+	go func() { feeds.Run(ctx, c, q); close(feedsDone) }()
 	slog.Info("Notifleet starting", "listen", c.Listen, "destinations", len(c.Destinations), "routes", len(c.Routes), "feeds", len(c.Feeds))
 	workerStopped := false
 	select {
@@ -75,8 +83,8 @@ func run() error {
 	}
 	shutdownCtx, stop := context.WithTimeout(context.Background(), 20*time.Second)
 	defer stop()
-	if shutdownErr := server.Shutdown(shutdownCtx); shutdownErr != nil {
-		server.Close()
+	if shutdownErr := httpServer.Shutdown(shutdownCtx); shutdownErr != nil {
+		httpServer.Close()
 		if err == nil {
 			err = shutdownErr
 		}

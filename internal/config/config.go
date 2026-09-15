@@ -1,4 +1,6 @@
-package main
+// Package config loads and validates Notifleet's TOML configuration:
+// server limits, destinations, routes, and feeds.
+package config
 
 import (
 	"bytes"
@@ -16,7 +18,10 @@ import (
 	"github.com/pelletier/go-toml/v2"
 )
 
-var namePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,64}$`)
+// NamePattern is the allowed charset for destination, route, and feed names.
+// Exported because internal/queue re-validates target names loaded from disk.
+var NamePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,64}$`)
+
 var discordPath = regexp.MustCompile(`^/api(?:/v[0-9]+)?/webhooks/[0-9]+/[A-Za-z0-9._-]+$`)
 var slackPath = regexp.MustCompile(`^/services/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+$`)
 var botPattern = regexp.MustCompile(`^[0-9]+:[A-Za-z0-9_-]+$`)
@@ -34,16 +39,6 @@ type Config struct {
 	Feeds             map[string]Feed        `toml:"feeds"`
 }
 
-// Feed polls an RSS 2.0 or Atom URL and enqueues one notification per new
-// item to the named fleet (an existing route). PollSeconds and MaxItems are
-// validated in loadConfig.
-type Feed struct {
-	URL         string `toml:"url"`
-	Fleet       string `toml:"fleet"`
-	PollSeconds int    `toml:"poll_seconds"`
-	MaxItems    int    `toml:"max_items"`
-}
-
 type Destination struct {
 	Provider            string `toml:"provider" json:"provider"`
 	WebhookURL          string `toml:"webhook_url" json:"webhook_url,omitempty"`
@@ -55,16 +50,14 @@ type Destination struct {
 	AllowPrivateNetwork bool   `toml:"allow_private_network" json:"allow_private_network,omitempty"`
 }
 
-func decodeStrict(r io.Reader, v any) error {
-	d := json.NewDecoder(r)
-	d.DisallowUnknownFields()
-	if err := d.Decode(v); err != nil {
-		return err
-	}
-	if err := d.Decode(new(any)); err != io.EOF {
-		return errors.New("expected exactly one JSON object")
-	}
-	return nil
+// Feed polls an RSS 2.0 or Atom URL and enqueues one notification per new
+// item to the named fleet (an existing route). PollSeconds and MaxItems are
+// validated in Load.
+type Feed struct {
+	URL         string `toml:"url"`
+	Fleet       string `toml:"fleet"`
+	PollSeconds int    `toml:"poll_seconds"`
+	MaxItems    int    `toml:"max_items"`
 }
 
 // Secret references are resolved after TOML decoding, so quotes in a secret
@@ -84,7 +77,7 @@ func secret(value string) (string, error) {
 	return v, nil
 }
 
-func loadConfig(path string) (Config, error) {
+func Load(path string) (Config, error) {
 	c := Config{Listen: "127.0.0.1:8080", DataDir: "./data", MaxJobs: 10000, MaxAttempts: 5, RetentionHours: 24, RequestsPerMinute: 120}
 	f, err := os.Open(path)
 	if err != nil {
@@ -120,7 +113,7 @@ func loadConfig(path string) (Config, error) {
 		return c, errors.New("configure 1–64 destinations and routes")
 	}
 	for name, d := range c.Destinations {
-		if !namePattern.MatchString(name) {
+		if !NamePattern.MatchString(name) {
 			return c, errors.New("invalid destination name")
 		}
 		for _, field := range []*string{&d.WebhookURL, &d.Token, &d.User} {
@@ -137,7 +130,7 @@ func loadConfig(path string) (Config, error) {
 		c.Destinations[name] = d
 	}
 	for name, targets := range c.Routes {
-		if !namePattern.MatchString(name) || len(targets) == 0 || len(targets) > 64 {
+		if !NamePattern.MatchString(name) || len(targets) == 0 || len(targets) > 64 {
 			return c, errors.New("invalid route name or target count")
 		}
 		seen := map[string]bool{}
@@ -152,7 +145,7 @@ func loadConfig(path string) (Config, error) {
 		return c, errors.New("configure at most 32 feeds")
 	}
 	for name, feed := range c.Feeds {
-		if !namePattern.MatchString(name) {
+		if !NamePattern.MatchString(name) {
 			return c, errors.New("invalid feed name")
 		}
 		if _, err := feedURL(feed.URL); err != nil {
@@ -174,7 +167,8 @@ func loadConfig(path string) (Config, error) {
 // feedURL is deliberately looser than secureURL (query strings and non-443
 // ports are common for RSS endpoints); it still requires HTTPS with no
 // embedded credentials or fragment. SSRF protection is enforced separately
-// at dial time in providers.go via publicIP, applied to feed fetches too.
+// at dial time in internal/providers via its dial-time public-IP check,
+// applied to feed fetches too.
 func feedURL(raw string) (*url.URL, error) {
 	u, err := url.Parse(raw)
 	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.Fragment != "" || u.Opaque != "" {
@@ -226,7 +220,7 @@ func (d Destination) validate() error {
 		if u.Path != "" && u.Path != "/" {
 			return errors.New("ntfy server_url must be a server root")
 		}
-		if !namePattern.MatchString(d.Topic) {
+		if !NamePattern.MatchString(d.Topic) {
 			return errors.New("ntfy topic must contain 1–64 letters, digits, underscores or hyphens")
 		}
 	default:
@@ -235,7 +229,10 @@ func (d Destination) validate() error {
 	return nil
 }
 
-func (d Destination) fingerprint() string {
+// Fingerprint identifies the exact destination configuration a queued
+// target was created against, so config changes never redirect pending
+// messages. Existing queue records depend on this JSON encoding.
+func (d Destination) Fingerprint() string {
 	b, _ := json.Marshal(d)
 	h := sha256.Sum256(b)
 	return hex.EncodeToString(h[:])

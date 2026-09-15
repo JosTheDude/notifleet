@@ -1,4 +1,4 @@
-package main
+package providers
 
 import (
 	"context"
@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"notifleet/internal/config"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -27,7 +29,7 @@ func TestProviderRequests(t *testing.T) {
 	m := Message{Title: "Backup & restore", Message: "Hello <!channel> @everyone\n世界"}
 	for _, provider := range []string{"discord", "slack", "pushover", "telegram", "ntfy"} {
 		t.Run(provider, func(t *testing.T) {
-			d := Destination{Provider: provider, WebhookURL: "https://example.com/hook", Token: "123:secret", User: "user&key", ChatID: "-10042", ServerURL: "https://ntfy.sh", Topic: "backups"}
+			d := config.Destination{Provider: provider, WebhookURL: "https://example.com/hook", Token: "123:secret", User: "user&key", ChatID: "-10042", ServerURL: "https://ntfy.sh", Topic: "backups"}
 			r, err := providerRequest(context.Background(), d, m)
 			if err != nil {
 				t.Fatal(err)
@@ -97,8 +99,8 @@ func TestProviderResponses(t *testing.T) {
 		{"discord", 503, `secret-token`, false, true},
 	} {
 		t.Run(tc.provider+"/"+tc.body, func(t *testing.T) {
-			d := Destination{Provider: tc.provider, WebhookURL: "https://example.com", ServerURL: "https://ntfy.sh"}
-			r := deliver(context.Background(), mockClient(tc.status, tc.body, nil), d, Message{Message: "hello"})
+			d := config.Destination{Provider: tc.provider, WebhookURL: "https://example.com", ServerURL: "https://ntfy.sh"}
+			r := Deliver(context.Background(), mockClient(tc.status, tc.body, nil), d, Message{Message: "hello"})
 			if r.Success != tc.success || r.Retry != tc.retry || strings.Contains(r.Code, "secret") {
 				t.Fatalf("unexpected result: %+v", r)
 			}
@@ -129,7 +131,7 @@ func TestNetworkBoundary(t *testing.T) {
 			t.Errorf("blocked %s", address)
 		}
 	}
-	client := newDeliveryClient(false)
+	client := NewDeliveryClient(false)
 	defer client.CloseIdleConnections()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -142,15 +144,39 @@ func TestNetworkBoundary(t *testing.T) {
 	}
 }
 
+func TestMessageBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		provider, title, body string
+		valid                 bool
+	}{
+		{"discord", "", strings.Repeat("😀", 1000), true},
+		{"discord", "A", strings.Repeat("😀", 999), false},
+		{"slack", "", strings.Repeat("a", 3000), true},
+		{"slack", "", strings.Repeat("a", 3001), false},
+		{"telegram", "", strings.Repeat("a", 4096), true},
+		{"telegram", "A", strings.Repeat("a", 4096), false},
+		{"pushover", "", strings.Repeat("界", 1024), true},
+		{"pushover", "", strings.Repeat("界", 1025), false},
+		{"ntfy", "", strings.Repeat("\n", 2100), false},
+		{"ntfy", "", "hello", true},
+	} {
+		c := config.Config{Routes: map[string][]string{"default": {"chat"}}, Destinations: map[string]config.Destination{"chat": {Provider: tc.provider, Topic: "test"}}}
+		err := ValidateMessage(Message{Route: "default", Title: tc.title, Message: tc.body}, c)
+		if (err == nil) != tc.valid {
+			t.Errorf("%s boundary: %v", tc.provider, err)
+		}
+	}
+}
+
 func TestRedirectDoesNotForwardSecrets(t *testing.T) {
 	received := false
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { received = true }))
 	defer target.Close()
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, target.URL, 307) }))
 	defer origin.Close()
-	client := newDeliveryClient(true)
+	client := NewDeliveryClient(true)
 	defer client.CloseIdleConnections()
-	r := deliver(context.Background(), client, Destination{Provider: "ntfy", ServerURL: origin.URL, Token: "private-token"}, Message{Message: "private-message"})
+	r := Deliver(context.Background(), client, config.Destination{Provider: "ntfy", ServerURL: origin.URL, Token: "private-token"}, Message{Message: "private-message"})
 	if r.Success || r.Retry || received {
 		t.Fatalf("redirect followed: %+v", r)
 	}
