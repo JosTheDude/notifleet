@@ -44,6 +44,9 @@ type Destination struct {
 	WebhookURL          string `toml:"webhook_url" json:"webhook_url,omitempty"`
 	Token               string `toml:"token" json:"token,omitempty"`
 	User                string `toml:"user" json:"user,omitempty"`
+	Priority            int    `toml:"priority" json:"priority,omitempty"`
+	RetrySeconds        int    `toml:"retry_seconds" json:"retry_seconds,omitempty"`
+	ExpireSeconds       int    `toml:"expire_seconds" json:"expire_seconds,omitempty"`
 	ChatID              string `toml:"chat_id" json:"chat_id,omitempty"`
 	ServerURL           string `toml:"server_url" json:"server_url,omitempty"`
 	Topic               string `toml:"topic" json:"topic,omitempty"`
@@ -193,6 +196,9 @@ func (d Destination) validate() error {
 	if d.PingEveryone && d.Provider != "discord" {
 		return errors.New("ping_everyone is only supported for discord")
 	}
+	if d.Provider != "pushover" && (d.Priority != 0 || d.RetrySeconds != 0 || d.ExpireSeconds != 0) {
+		return errors.New("priority, retry_seconds and expire_seconds are only supported for Pushover")
+	}
 	switch d.Provider {
 	case "discord", "slack":
 		u, err := secureURL(d.WebhookURL)
@@ -208,6 +214,16 @@ func (d Destination) validate() error {
 	case "pushover":
 		if d.Token == "" || d.User == "" {
 			return errors.New("Pushover requires token and user")
+		}
+		if d.Priority < -2 || d.Priority > 2 {
+			return errors.New("Pushover priority must be -2 through 2")
+		}
+		if d.Priority == 2 {
+			if d.RetrySeconds < 30 || d.ExpireSeconds < 1 || d.ExpireSeconds > 10800 {
+				return errors.New("Pushover emergency priority requires retry_seconds >= 30 and expire_seconds 1-10800")
+			}
+		} else if d.RetrySeconds != 0 || d.ExpireSeconds != 0 {
+			return errors.New("Pushover retry_seconds and expire_seconds require emergency priority 2")
 		}
 	case "telegram":
 		if !botPattern.MatchString(d.Token) || d.ChatID == "" {

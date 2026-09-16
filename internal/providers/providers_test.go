@@ -40,7 +40,7 @@ func TestProviderRequests(t *testing.T) {
 			body, _ := io.ReadAll(r.Body)
 			if provider == "pushover" {
 				v, err := url.ParseQuery(string(body))
-				if err != nil || v.Get("message") != m.Message || v.Get("title") != m.Title || v.Get("token") != d.Token || v.Get("user") != d.User || r.URL.String() != "https://api.pushover.net/1/messages.json" {
+				if err != nil || v.Get("message") != m.Message || v.Get("title") != m.Title || v.Get("token") != d.Token || v.Get("user") != d.User || v.Get("priority") != "0" || r.URL.String() != "https://api.pushover.net/1/messages.json" {
 					t.Fatalf("bad Pushover request: %s", body)
 				}
 				return
@@ -72,6 +72,19 @@ func TestProviderRequests(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestPushoverEmergencyRequest(t *testing.T) {
+	d := config.Destination{Provider: "pushover", Token: "app", User: "user", Priority: 2, RetrySeconds: 60, ExpireSeconds: 1800}
+	r, err := providerRequest(context.Background(), d, Message{Message: "wake up"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(r.Body)
+	v, err := url.ParseQuery(string(body))
+	if err != nil || v.Get("priority") != "2" || v.Get("retry") != "60" || v.Get("expire") != "1800" {
+		t.Fatalf("bad Pushover emergency request: %s", body)
 	}
 }
 

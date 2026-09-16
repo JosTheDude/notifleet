@@ -1,6 +1,6 @@
 services:
   notifleet:
-    build: .
+    image: ghcr.io/josthedude/notifleet:latest
     restart: unless-stopped
     init: true
     env_file: .env

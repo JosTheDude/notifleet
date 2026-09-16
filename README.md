@@ -31,7 +31,7 @@ internal/providers/  per-destination requests/responses, hardened HTTP client
 internal/queue/    durable job storage, delivery worker, retries
 internal/feeds/    RSS/Atom polling and feed-to-fleet notification
 configs/           config.example.toml reference
-.github/workflows/ CI: gofmt, vet, race tests, build, govulncheck, Docker build
+.github/workflows/ CI: gofmt, vet, race tests, build, govulncheck, multi-platform image publishing
 ```
 
 Each package under `internal/` has its own `*_test.go` suite alongside it. See `AGENTS.md` for the package dependency graph and what each layer owns.
@@ -49,15 +49,23 @@ Each package under `internal/` has its own `*_test.go` suite alongside it. See `
 
 2. Put the generated value in `NOTIFLEET_API_KEY` in `.env`. Set `DISCORD_WEBHOOK_URL` to your Discord webhook URL. The minimal example only enables Discord. Create that webhook in your Discord server's **Integrations → Webhooks** settings.
 
-3. Build and start:
+3. Pull the published image and start:
 
    ```sh
-   docker compose up -d --build
+   docker compose pull
+   docker compose up -d
    docker compose ps
    curl --fail http://127.0.0.1:8080/healthz
    ```
 
-Startup validates the configuration before accepting requests. To validate separately without starting the service, run `docker compose run --rm --build --no-deps notifleet -config /config/config.toml -check`. For startup errors, use `docker compose logs --tail=100 notifleet`. Stop it with `docker compose down`; the queue volume is preserved.
+Startup validates the configuration before accepting requests. To validate separately without starting the service, run `docker compose run --rm --no-deps notifleet -config /config/config.toml -check`. For startup errors, use `docker compose logs --tail=100 notifleet`. Stop it with `docker compose down`; the queue volume is preserved.
+
+Images are published to `ghcr.io/josthedude/notifleet` for `linux/amd64` and `linux/arm64`. `latest` tracks `main`; releases tagged `v1.2.3` also publish `1.2.3` and `1.2` image tags. To update a remote installation, run:
+
+```sh
+docker compose pull
+docker compose up -d
+```
 
 Compose binds the host port to **loopback only**, runs a non-root, shell-free container with a read-only root filesystem, drops all capabilities, and persists the queue in `notifleet-data`. Config is mounted read-only. The daemon must be running to use Docker.
 
@@ -173,7 +181,7 @@ Secrets (`api_keys`, `webhook_url`, `token`, `user`) **must** be environment ref
 
 - **Discord:** use `https://discord.com/api/webhooks/...`. Discord is called with `wait=true` to wait for message acceptance.
 - **Slack:** create an app with Incoming Webhooks enabled, authorize it for a channel, and use its `https://hooks.slack.com/services/...` URL.
-- **Pushover:** register an application at [pushover.net](https://pushover.net/apps/build), then use its app token and your user/group key. Delivery uses normal priority; emergency acknowledgement workflows are not implemented.
+- **Pushover:** register an application at [pushover.net](https://pushover.net/apps/build), then use its app token and your user/group key. Set `priority` per destination to `-2` (silent), `-1` (low), `0` (normal, the default), `1` (high), or `2` (emergency). Emergency priority also requires `retry_seconds` of at least 30 and `expire_seconds` from 1 to 10800; Pushover repeats it until the user acknowledges it or it expires. Notifleet treats Pushover's initial acceptance as delivery and does not expose the later acknowledgement receipt. Configure separate Pushover destinations pointing to the same account when routes need different priorities.
 - **Telegram:** create a bot with BotFather. Start a conversation with it or add it to the intended group/channel with posting permission, then set the chat ID. The ID is a quoted string, for example `chat_id = "-10042"`; negative group/channel IDs are supported.
 - **ntfy:** use `https://ntfy.sh` or your own HTTPS server root. Set `topic` and optionally `token = "env:NTFY_TOKEN"`. **Public ntfy topics are not private or access-controlled merely because the name is random.** Use authenticated self-hosting or a protected topic for sensitive messages. A random, unguessable topic is the minimum for nonsensitive public-service use.
 

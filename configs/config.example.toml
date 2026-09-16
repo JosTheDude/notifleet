@@ -60,6 +60,11 @@ requests_per_minute = 120
 # provider = "pushover"
 # token = "env:PUSHOVER_APP_TOKEN"
 # user = "env:PUSHOVER_USER_KEY"
+# # -2=silent, -1=low, 0=normal, 1=high, 2=emergency. Emergency
+# # notifications repeat until acknowledged or expired and additionally require:
+# priority = 1
+# # retry_seconds = 60  # emergency only; minimum 30
+# # expire_seconds = 1800  # emergency only; 1-10800
 
 # [destinations.telegram]
 # provider = "telegram"

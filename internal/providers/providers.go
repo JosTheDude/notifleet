@@ -167,7 +167,12 @@ func providerRequest(ctx context.Context, d config.Destination, m Message) (*htt
 		payload = map[string]any{"text": escaped, "mrkdwn": false, "unfurl_links": false, "unfurl_media": false, "blocks": []any{map[string]any{"type": "section", "text": map[string]any{"type": "plain_text", "text": m.text(), "emoji": false}}}}
 	case "pushover":
 		endpoint, contentType = "https://api.pushover.net/1/messages.json", "application/x-www-form-urlencoded"
-		body = []byte(url.Values{"token": {d.Token}, "user": {d.User}, "title": {m.Title}, "message": {m.Message}}.Encode())
+		form := url.Values{"token": {d.Token}, "user": {d.User}, "title": {m.Title}, "message": {m.Message}, "priority": {strconv.Itoa(d.Priority)}}
+		if d.Priority == 2 {
+			form.Set("retry", strconv.Itoa(d.RetrySeconds))
+			form.Set("expire", strconv.Itoa(d.ExpireSeconds))
+		}
+		body = []byte(form.Encode())
 	case "telegram":
 		endpoint = "https://api.telegram.org/bot" + d.Token + "/sendMessage"
 		payload = map[string]any{"chat_id": d.ChatID, "text": m.text(), "link_preview_options": map[string]any{"is_disabled": true}}

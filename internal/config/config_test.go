@@ -121,6 +121,35 @@ func TestEndpointValidation(t *testing.T) {
 	}
 }
 
+func TestPushoverPriorityValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name                    string
+		priority, retry, expire int
+		valid                   bool
+	}{
+		{"lowest", -2, 0, 0, true},
+		{"high", 1, 0, 0, true},
+		{"emergency", 2, 30, 10800, true},
+		{"priority too low", -3, 0, 0, false},
+		{"priority too high", 3, 0, 0, false},
+		{"emergency retry too short", 2, 29, 1800, false},
+		{"emergency expiry missing", 2, 60, 0, false},
+		{"emergency expiry too long", 2, 60, 10801, false},
+		{"retry on normal", 0, 60, 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := Destination{Provider: "pushover", Token: "app", User: "user", Priority: tc.priority, RetrySeconds: tc.retry, ExpireSeconds: tc.expire}
+			if err := d.validate(); (err == nil) != tc.valid {
+				t.Fatalf("valid=%v error=%v", tc.valid, err)
+			}
+		})
+	}
+
+	if err := (Destination{Provider: "discord", WebhookURL: "https://discord.com/api/webhooks/123/token", Priority: 1}).validate(); err == nil {
+		t.Fatal("accepted Pushover priority on Discord")
+	}
+}
+
 func TestSecretResolutionCannotInjectTOML(t *testing.T) {
 	t.Setenv("QUOTED_SECRET", `abc" # [routes.evil]`)
 	got, err := secret("env:QUOTED_SECRET")
