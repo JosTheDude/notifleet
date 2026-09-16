@@ -120,7 +120,11 @@ func ValidateMessage(m Message, c config.Config) error {
 		d := c.Destinations[name]
 		switch d.Provider {
 		case "discord":
-			if len(utf16.Encode([]rune(m.text()))) > 2000 {
+			n := len(utf16.Encode([]rune(m.text())))
+			if d.PingEveryone {
+				n += len(utf16.Encode([]rune("@everyone ")))
+			}
+			if n > 2000 {
 				return errDiscordLimit
 			}
 		case "slack":
@@ -152,7 +156,11 @@ func providerRequest(ctx context.Context, d config.Destination, m Message) (*htt
 	switch d.Provider {
 	case "discord":
 		endpoint += "?wait=true"
-		payload = map[string]any{"content": m.text(), "allowed_mentions": map[string]any{"parse": []string{}}}
+		content, parse := m.text(), []string{}
+		if d.PingEveryone {
+			content, parse = "@everyone "+content, []string{"everyone"}
+		}
+		payload = map[string]any{"content": content, "allowed_mentions": map[string]any{"parse": parse}}
 	case "slack":
 		// Escape the fallback too: notification previews must not parse mentions.
 		escaped := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace(m.text())

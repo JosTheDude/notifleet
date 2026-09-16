@@ -48,6 +48,7 @@ type Destination struct {
 	ServerURL           string `toml:"server_url" json:"server_url,omitempty"`
 	Topic               string `toml:"topic" json:"topic,omitempty"`
 	AllowPrivateNetwork bool   `toml:"allow_private_network" json:"allow_private_network,omitempty"`
+	PingEveryone        bool   `toml:"ping_everyone" json:"ping_everyone,omitempty"`
 }
 
 // Feed polls an RSS 2.0 or Atom URL and enqueues one notification per new
@@ -188,6 +189,9 @@ func secureURL(raw string) (*url.URL, error) {
 func (d Destination) validate() error {
 	if d.AllowPrivateNetwork && d.Provider != "ntfy" {
 		return errors.New("private network access is only supported for self-hosted ntfy")
+	}
+	if d.PingEveryone && d.Provider != "discord" {
+		return errors.New("ping_everyone is only supported for discord")
 	}
 	switch d.Provider {
 	case "discord", "slack":
